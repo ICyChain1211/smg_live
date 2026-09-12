@@ -1,59 +1,46 @@
-# SMG 网页直播观看增强
+# SMGTV 稳定性优化版
 
-在浏览器端为 SMG 视频直播页面提供更顺畅的观看体验，并对部分浏览器环境做兼容性优化。
+基于 [Popukok/smg_live](https://github.com/Popukok/smg_live) 的个人维护 Fork，保留上游历史与 MIT 许可证。当前版本 **0.18.3**。本仓库的版本与改动由 ICyChain1211 维护，不代表上游作者发布。
 
-# 说明
+主要处理播放地址缓存期限、失败恢复、重复检查和异步换台问题。**已通过本地模拟测试，优化版尚未进行真实直播长时间兼容性验证；不保证网站改版后永久可用。**
 
-26.08.21 ---> 去掉了接口返回M3U8地址，可能出于业务需求，保留体育新闻回看。
+## 安装与更新
 
-26.09.08 ---> 地址由火山（volc-stream）改为腾讯（tencent-vods），回看（timeshift）和直播（token）改为两套路径，封堵升级测试（有概率）。
+1. 安装并启用 Tampermonkey（油猴）。
+2. 先停用其他 SMGTV 脚本，避免多份同时拦截接口。
+3. [安装本 Fork 的脚本](https://raw.githubusercontent.com/ICyChain1211/smg_live/refs/heads/main/smg_fivestar.user.js)。
+4. 打开 [看看新闻电视页](https://live.kankanews.com/huikan)，选择频道。
 
-26.09.09 ---> 已恢复火山源（volc-stream），后续是否彻底切换腾讯源（tencent-vods），未知，仅做记录。
+脚本的更新地址指向本 Fork，不会被上游版本直接覆盖。是否自动检查更新取决于油猴设置。修改脚本前建议保留当前可用版本；如有兼容问题，停用本版本、启用备份后刷新即可回退。版本安装成功并不等于已验证所有频道能够播放。
 
-# 安装
+## 改进
 
-1. 浏览器安装 [Tampermonkey](https://tampermonkey.net/) 扩展（**推荐**）
-2. 点击下方链接安装脚本
+- **有效期**：JWT 与 `volcTime` 取较早期限，提前 30 秒停止复用；重新核验旧缓存，避免把短期地址当作 12 小时有效。
+- **有限恢复**：观察到当前播放清单的 403/410，或视频元素报告网络/不支持源错误时，淘汰缓存并尝试恢复。最多连续三轮，失败后暂停；持续正常播放约 30 秒或选择频道/节目后重置。
+- **请求控制**：同频道合并正在进行的恢复请求，每个内部 API 请求最多等待 10 秒（包括响应体）。一轮恢复可能查询最近 7 天节目单，因此一轮可能包含多个请求。
+- **异步状态**：换台或组件销毁后，旧请求不再重载旧播放器；请求异常会释放恢复锁。
+- **原始数据**：内部 API 请求避免经过本脚本的响应改写，保留服务器原始回看标记，减少错误节目选择。
+- **重复检查**：常驻检查间隔从 500 毫秒调整为 2000 毫秒，事件在 100 毫秒内合并，清理旧视频监听器。
+- **兼容与边界**：保留上游全屏及移动端处理；接口改写限制到指定域名与电视 API，修复 XHR 对象重用时的旧响应残留。
 
-| 正式版 (GitHub 源)                                                                           |
-|---------------------------------------------------------------------------------------------|
-| [安装](https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js)  |
+正常播放不会仅因缓存到期而被脚本强制重载。网站更换接口、鉴权、播放路径或网络出现异常时，仍可能需要进一步适配。独立于页面 fetch/XHR 的播放器请求，只能依赖其是否向视频元素报告错误，不能保证捕获全部故障。
 
-3. 打开 [SMG 直播页面](https://live.kankanews.com/huikan?id=10)，选择频道即可观看
+## 验证
 
-# 兼容性
+不依赖第三方测试包，需要 Node.js 22 或更新版本：
 
-支持**最新版** Chrome、Firefox、Safari，脚本管理器推荐使用 [Tampermonkey](https://tampermonkey.net/)。
+```sh
+node --check smg_fivestar.user.js
+node tests/stability.cjs
+```
 
-> ⚠️ 由于两款插件存在技术差异，基于 Tampermonkey（油猴）开发的脚本，在 Violentmonkey（暴力猴）上可能存在兼容性问题，**建议使用油猴插件**。
+目前包含 **39 项模拟行为检查**：缓存期限、旧缓存淘汰、原始数据隔离、请求超时、请求合并、有限重试、换台/销毁后异步返回、事件合并、XHR 重用和正常播放不重载。测试不连接直播接口，也不修改已安装的油猴脚本。
 
-### Safari（macOS / iOS）
+当前提供本地可运行测试，尚未启用 GitHub Actions 自动测试。模拟通过不能替代真实直播、跨期限长播及 Safari/iOS 实测。
 
-- **macOS Safari**：使用 [Tampermonkey](https://tampermonkey.net/) 或免费的 [Userscripts App](https://apps.apple.com/app/userscripts/id1463198887) 加载脚本
-- **iOS / iPadOS Safari**（需 iOS 15+）：安装 [Userscripts App](https://apps.apple.com/app/userscripts/id1463198887) 或 Tampermonkey，在「设置 → Safari → 扩展」中启用并允许访问 `kankanews.com`，导入脚本即可
-- iPhone 全屏使用 iOS 原生视频全屏；CSS 全屏已适配动态视口（dvh/dvw）与安全区域（刘海 / Home 指示条）
+## 来源与许可证
 
-> ⚠️ 若自行修改过脚本，建议在管理器中**关闭自动更新**，避免被上游版本覆盖本地改动。
-
-# 移动端
-
-在支持用户脚本的移动浏览器中均可使用（Android 端此类浏览器通常内置 Violentmonkey，请一并留意上方兼容性提示）：
-
-- **Kiwi Browser**、**Chrome**、**Edge**：安装体验与桌面端最接近
-- **Firefox for Android**：支持扩展与脚本
-- **X浏览器**：轻量、支持用户脚本
-- **iPhone / iPad**：直接使用 Safari + Userscripts App 或 Tampermonkey，无需更换浏览器
-
-# 苹果设备使用说明
-
-**macOS Safari**（二选一）：
-- Userscripts（免费开源，推荐）：App Store 安装 → Safari 设置 → 扩展中启用 → 打开 Userscripts App 设定脚本目录 → 将 `smg_fivestar.user.js` 放入该目录
-- Tampermonkey：App Store 安装 → Safari 设置 → 扩展中启用并允许访问网站 → 导入脚本
-
-**iPhone / iPad（需 iOS 15+）**：
-1. App Store 安装 Userscripts（免费）或 Tampermonkey
-2. 设置 → Safari → 扩展 → 启用并允许访问 `kankanews.com`
-3. 将 `smg_fivestar.user.js` 放入 Userscripts 的脚本目录（或经分享菜单导入）
-4. 打开 [SMG 直播页面](https://live.kankanews.com/huikan?id=10) 选择频道即可
-
-本仓库内容仅供学习交流。
+- 上游：[Popukok/smg_live](https://github.com/Popukok/smg_live)
+- 本次基于上游 `df9902e` 所含的 `0.18` 脚本继续维护。
+- 许可证：[MIT](LICENSE)，原版权声明保留。分发的 userscript 内也包含完整许可证。
+- 更新记录：[CHANGELOG.md](CHANGELOG.md)

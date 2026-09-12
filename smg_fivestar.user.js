@@ -1,16 +1,40 @@
 // ==UserScript==
-// @name             收看SMGTV电视节目
-// @namespace        http://tampermonkey.net/
-// @version          0.18
+// @name             收看SMGTV电视节目（稳定性优化版）
+// @namespace        https://github.com/ICyChain1211/smg_live
+// @version          0.18.3
 // @description      收看SMGTV，并解除页面部分限制
-// @author           https://github.com/Popukok
+// @author           Popukok (original), ICyChain1211 (stability fork)
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
-// @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
+// @updateURL        https://raw.githubusercontent.com/ICyChain1211/smg_live/refs/heads/main/smg_fivestar.user.js
+// @downloadURL      https://raw.githubusercontent.com/ICyChain1211/smg_live/refs/heads/main/smg_fivestar.user.js
+// @license          MIT
 // @grant            none
 // @run-at           document-start
 // ==/UserScript==
+/*
+MIT License
+
+Copyright (c) 2025 _xFox
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
 (function() {
     'use strict';
     const STYLE_ID = 'smgtv-unlock-style';
@@ -20,7 +44,13 @@
     const FULLSCREEN_BUTTON_SELECTOR = '.xgplayer-fullscreen';
     const VIDEO_READY_EVENTS = ['loadeddata', 'canplay', 'playing', 'timeupdate', 'progress'];
     const VIDEO_RESET_EVENTS = ['loadstart', 'waiting', 'stalled', 'emptied'];
-    const watchedVideos = new WeakSet();
+    const watchedVideos = new WeakMap();
+    const activeComponents = new Set();
+    const pendingAcquisitions = new Map();
+    const persistedChannelsLoaded = new Set();
+    const originalFetch = window.fetch;
+    const RETRY_DELAYS = [5000, 15000, 60000];
+
     const streamAddressCache = Object.create(null);
     const channelShiftBaseCache = Object.create(null);
     const channelLiveBaseCache = Object.create(null);
@@ -33,16 +63,28 @@
         'wzKRqZO2oNZkuNmF2Va8kLgiEQAAcxYc8JgTN+uQQNpsep4n/o1sArTJooZIF17E\n' +
         'tSqSgXDcJ7yDj5rc7wIDAQAB\n' +
         '-----END PUBLIC KEY-----';
+    // Local patch, 2026-09-12: cache only until the earliest URL deadline.
+    // This does not change server-issued credentials or the URL itself.
     function parseJwtExp(url) {
         try {
-            const token = new URL(url).searchParams.get('token');
-            if (!token) return null;
-            const payload = token.split('.')[1];
-            if (!payload) return null;
-            const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-            const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
-            const json = JSON.parse(atob(padded));
-            return typeof json.exp === 'number' ? json.exp * 1000 : null;
+            const u = new URL(url);
+            const limits = [];
+            const token = u.searchParams.get('token');
+            if (token) {
+                const payload = token.split('.')[1];
+                if (!payload) return null;
+                const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+                const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+                const json = JSON.parse(atob(padded));
+                if (!Number.isFinite(json.exp) || json.exp <= 0) return null;
+                limits.push(json.exp * 1000);
+            }
+            if (u.searchParams.has('volcTime')) {
+                const value = u.searchParams.get('volcTime');
+                if (!/^\d{10}$/.test(value)) return null;
+                limits.push(Number(value) * 1000);
+            }
+            return limits.length ? Math.min(...limits) - 30000 : null;
         } catch (e) {
             return null;
         }
@@ -137,16 +179,25 @@
         merged.sign = smgMd5(smgMd5(s + SMG_API_SECRET));
         return merged;
     }
-    function smgApiGet(path, params) {
-        const signed = smgSignParams(params || {});
-        const q = Object.keys(params || {}).map(k =>
-            encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
-        const headers = { Accept: 'application/json, text/plain, */*' };
-        Object.keys(signed).forEach(hk => { headers[hk] = signed[hk]; });
-        headers['M-Uuid'] = localStorage.getItem('uuid') || '';
-        return fetch('https://kapi.kankanews.com' + path + (q ? '?' + q : ''), { headers })
-            .then(r => r.json())
-            .catch(() => null);
+    async function smgApiGet(path, params) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        try {
+            const signed = smgSignParams(params || {});
+            const q = new URLSearchParams(params || {}).toString();
+            const headers = { Accept: 'application/json, text/plain, */*' };
+            Object.keys(signed).forEach(k => { headers[k] = signed[k]; });
+            try { headers['M-Uuid'] = localStorage.getItem('uuid') || ''; } catch (e) {}
+            // Keep source data untouched by our page-response wrapper.
+            const res = await originalFetch.call(window,
+                'https://kapi.kankanews.com' + path + (q ? '?' + q : ''),
+                { headers, signal: controller.signal });
+            return res.ok ? await res.json() : null;
+        } catch (e) {
+            return null;
+        } finally {
+            clearTimeout(timeout);
+        }
     }
     function hexToBase64(hexStr) {
         try {
@@ -210,8 +261,12 @@
             const raw = localStorage.getItem(LS_KEY_PREFIX + channelId);
             if (!raw) return null;
             const data = JSON.parse(raw);
-            if (data && data.url && typeof data.exp === 'number' && Date.now() < data.exp) {
-                return { url: data.url, exp: data.exp };
+            // Revalidate older caches: their saved exp may only reflect JWT expiry.
+            const urlExp = data && data.url ? parseJwtExp(data.url) : null;
+            const exp = Number.isFinite(data?.exp) && urlExp != null
+                ? Math.min(data.exp, urlExp) : null;
+            if (exp != null && Date.now() < exp) {
+                return { url: data.url, exp: exp };
             }
             localStorage.removeItem(LS_KEY_PREFIX + channelId);
         } catch (e) {
@@ -221,7 +276,7 @@
     }
     function savePersistedShiftBase(channelId, url) {
         const exp = parseJwtExp(url);
-        if (exp == null) return;
+        if (exp == null || exp <= Date.now()) return;
         try {
             localStorage.setItem(LS_KEY_PREFIX + channelId, JSON.stringify({ url: url, exp: exp }));
         } catch (e) {}
@@ -266,9 +321,20 @@
     function getResultChannelId(result) {
         return result?.channel_id || result?.channel_info?.id || result?.id;
     }
+    function serverAllowsReview(program) {
+        if (!program) return false;
+        if (Object.prototype.hasOwnProperty.call(program, '__smgServerReview')) {
+            return program.__smgServerReview === true;
+        }
+        const flag = program.can_review ?? program.is_review;
+        return flag === 1 || flag === '1' || flag === true;
+    }
     function forceOpenProgram(program) {
         if (!program) {
             return;
+        }
+        if (!Object.prototype.hasOwnProperty.call(program, '__smgServerReview')) {
+            program.__smgServerReview = serverAllowsReview(program);
         }
         program.is_shield = 0;
         program.can_review = 1;
@@ -337,6 +403,44 @@
                 .replace(/\?$/, '');
         }
     }
+    function getCachedBase(channelId) {
+        const key = String(channelId);
+        const now = Date.now();
+        if (!persistedChannelsLoaded.has(key)) {
+            persistedChannelsLoaded.add(key);
+            const saved = loadPersistedShiftBase(key);
+            if (saved) channelShiftBaseCache[key] = saved;
+        }
+        for (const cache of [channelShiftBaseCache, channelLiveBaseCache]) {
+            const entry = cache[key];
+            if (entry && entry.exp > now) return entry.url;
+            if (entry) delete cache[key];
+        }
+        return '';
+    }
+    function invalidateChannelCache(channelId) {
+        const key = String(channelId);
+        delete channelShiftBaseCache[key];
+        delete channelLiveBaseCache[key];
+        delete streamAddressCache[key];
+        persistedChannelsLoaded.add(key);
+        try { localStorage.removeItem(LS_KEY_PREFIX + key); } catch (e) {}
+    }
+    function requestStreamRecovery(component) {
+        if (!component || component.__smgDisposed || String(component.currChannel?.id) !== '10') return;
+        if (component.__smgNeedShiftBase || component.__smgRetryStopped) return;
+        invalidateChannelCache(component.currChannel.id);
+        component.__smgRejectedUrl = component.__smgStreamUrl || '';
+        component.__smgNeedShiftBase = true;
+        scheduleLoadingSync(component);
+    }
+    function observeStreamResponse(url, status) {
+        if (status !== 403 && status !== 410) return;
+        for (const component of activeComponents) {
+            // Only the current manifest, never an unrelated request or an old player.
+            if (url === component.__smgStreamUrl) requestStreamRecovery(component);
+        }
+    }
     function installReplayUrlPatch(component) {
         const XGPlayer = component.$xgplayer;
         if (!XGPlayer || component.__smgReplayPatchInstalled) {
@@ -358,10 +462,10 @@
                         const fromShift = /[?&]start=\d+/.test(url);
                         const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
                         const exp = parseJwtExp(url);
-                        if (exp != null) {
+                        if (exp != null && exp > now && url !== component.__smgRejectedUrl) {
                             store[channelId] = { url: base, exp: exp };
                         }
-                        if (fromShift) {
+                        if (fromShift && url !== component.__smgRejectedUrl) {
                             savePersistedShiftBase(channelId, base);
                             console.log('[SMGTV] 已抓取回看源');
                         } else {
@@ -369,28 +473,18 @@
                         }
                     }
                 }
-                let baseOk = '';
-                if (channelId != null) {
-                    if (!(channelShiftBaseCache[channelId] && channelShiftBaseCache[channelId].exp > now)) {
-                        const persisted = loadPersistedShiftBase(channelId);
-                        if (persisted) {
-                            channelShiftBaseCache[channelId] = persisted;
-                        }
-                    }
-                    const shiftEntry = channelShiftBaseCache[channelId];
-                    if (shiftEntry && shiftEntry.exp > now) {
-                        baseOk = shiftEntry.url;
-                    } else {
-                        const liveEntry = channelLiveBaseCache[channelId];
-                        if (liveEntry && liveEntry.exp > now) {
-                            baseOk = liveEntry.url;
-                        }
-                    }
+                const baseOk = channelId != null ? getCachedBase(channelId) : '';
+                const expiry = url ? parseJwtExp(url) : null;
+                if (String(channelId) === '10' &&
+                    ((expiry != null && expiry <= now) || url === component.__smgRejectedUrl)) {
+                    url = '';
+                    config.url = '';
                 }
                 const isReplay = config.isLive === false;
                 const hasStream = /\.m3u8/.test(url);
                 const hasWindow = /\bstart=\d/.test(url);
                 if (isReplay && hasWindow) {
+                    component.__smgStreamUrl = url;
                     return new target(...args);
                 }
                 if (isReplay && hasStream && !hasWindow && program?.start_time && program?.end_time) {
@@ -411,6 +505,8 @@
                         component.__smgNeedShiftBase = true;
                     }
                 }
+                component.__smgStreamUrl = config.url || '';
+                if (component.__smgStreamUrl) component.__smgNeedShiftBase = false;
                 return new target(...args);
             }
         });
@@ -425,23 +521,23 @@
         for (const list of lists) {
             if (!Array.isArray(list)) continue;
             for (const p of list) {
-                if (isEnded(p) && typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1) return p.id;
+                if (isEnded(p) && serverAllowsReview(p) && typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1) return p.id;
             }
         }
         for (const list of lists) {
             if (!Array.isArray(list)) continue;
             for (const p of list) {
-                if (isEnded(p) && p.is_review === 1) return p.id;
+                if (isEnded(p) && serverAllowsReview(p)) return p.id;
             }
         }
         return null;
     }
     function findDonorIdFromList(list) {
         if (!Array.isArray(list)) return null;
-        const news = list.find(p => p && p.is_review === 1 && p.id &&
+        const news = list.find(p => p && serverAllowsReview(p) && p.id &&
             typeof p.name === 'string' && p.name.indexOf('体育新闻') !== -1);
         if (news) return news.id;
-        const any = list.find(p => p && p.is_review === 1 && p.id);
+        const any = list.find(p => p && serverAllowsReview(p) && p.id);
         return any ? any.id : null;
     }
     function fetchShiftByDonor(channelId, donorId) {
@@ -459,7 +555,8 @@
                             u.searchParams.delete('end');
                             const base = u.toString();
                             const exp = parseJwtExp(url);
-                            channelShiftBaseCache[channelId] = { url: base, exp: exp || (Date.now() + 12 * 3600 * 1000) };
+                            if (exp == null || exp <= Date.now()) return resolve(null);
+                            channelShiftBaseCache[channelId] = { url: base, exp: exp };
                             savePersistedShiftBase(channelId, base);
                             console.log('[SMGTV] 已获取回看源');
                             resolve(base);
@@ -501,59 +598,49 @@
                 });
             });
     }
-    function maybeAutoCaptureShift(component, fromMonitor) {
-        if (!component || !component.__smgPatched || !component.__smgNeedShiftBase || !fromMonitor) {
-            return;
+    function getAcquisition(channelId, component) {
+        const key = String(channelId);
+        if (!pendingAcquisitions.has(key)) {
+            const task = Promise.resolve().then(() => acquireShiftBase(channelId, component))
+                .finally(() => pendingAcquisitions.delete(key));
+            pendingAcquisitions.set(key, task);
         }
+        return pendingAcquisitions.get(key);
+    }
+    async function maybeAutoCaptureShift(component) {
+        if (!component || component.__smgDisposed || !component.__smgPatched ||
+            !component.__smgNeedShiftBase || component.__smgAcquiring || component.__smgRetryStopped) return;
         const chId = component.currChannel?.id;
-        if (chId == null) {
-            return;
-        }
-        const now = Date.now();
-        if (!(channelShiftBaseCache[chId] && channelShiftBaseCache[chId].exp > now)) {
-            const persisted = loadPersistedShiftBase(chId);
-            if (persisted) {
-                channelShiftBaseCache[chId] = persisted;
-            }
-        }
-        const hasBase = !!(channelShiftBaseCache[chId] && channelShiftBaseCache[chId].exp > now) ||
-            !!(channelLiveBaseCache[chId] && channelLiveBaseCache[chId].exp > now);
-        if (hasBase) {
-            component.__smgNeedShiftBase = false;
-            return;
-        }
-        if (String(chId) !== '10') {
-            component.__smgNeedShiftBase = false;
-            return;
-        }
-        // 冷却：一次获取尝试后 60s 内不重复，避免心跳空转
-        const cooldownKey = '__smgShiftCooldown';
-        if (now - (component[cooldownKey] || 0) < 60000) {
-            return;
-        }
-        component[cooldownKey] = now;
-        if (component.__smgAcquiring) {
-            return;
-        }
+        if (String(chId) !== '10' || Date.now() < (component.__smgRetryAt || 0)) return;
+        const generation = component.__smgGeneration || 0;
         component.__smgAcquiring = true;
-        acquireShiftBase(chId, component).then(ok => {
-            component.__smgAcquiring = false;
+        const attempt = (component.__smgAcquireAttempts || 0) + 1;
+        component.__smgAcquireAttempts = attempt;
+        try {
+            const ok = getCachedBase(chId) || await getAcquisition(chId, component);
+            if (component.__smgDisposed || generation !== (component.__smgGeneration || 0) ||
+                String(component.currChannel?.id) !== String(chId)) return;
+            component.__smgRetryAt = Date.now() + RETRY_DELAYS[Math.min(attempt - 1, 2)];
+            component.__smgRetryStopped = attempt >= RETRY_DELAYS.length;
             if (ok) {
                 component.__smgNeedShiftBase = false;
-                component.__smgAcquireFails = 0;
-                // shift 基底已就绪：重载当前节目，让 Proxy 注入生效(之前空 url 播放器已失败)
-                if (component && typeof component.initPlayer === 'function') {
+                // Reload even when another path populated the cache after a failed player.
+                if (typeof component.initPlayer === 'function') {
                     component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
                 }
-            } else {
-                // 连续失败：拉长冷却避免反复请求；needShift 保留，用户换台/重试会重置
-                component.__smgAcquireFails = (component.__smgAcquireFails || 0) + 1;
-                if (component.__smgAcquireFails >= 3) {
-                    component[cooldownKey] = now + 10 * 60 * 1000;
-                    console.warn('[SMGTV] 暂无可用播放源');
-                }
+            } else if (component.__smgRetryStopped) {
+                console.warn('[SMGTV] 自动重试已暂停，请检查网络后重新选择频道或刷新页面');
             }
-        });
+        } catch (e) {
+            if (!component.__smgDisposed && generation === (component.__smgGeneration || 0)) {
+                component.__smgNeedShiftBase = true;
+                component.__smgRetryStopped = attempt >= RETRY_DELAYS.length;
+                component.__smgRetryAt = Date.now() + 60000;
+                console.warn('[SMGTV] 播放恢复失败，稍后有限重试');
+            }
+        } finally {
+            component.__smgAcquiring = false;
+        }
     }
     function recoverPlayerIfNeeded(component) {
         if (!component || typeof component.initPlayer !== 'function' || component.__smgRecovering) {
@@ -561,7 +648,9 @@
         }
         const video = getPlayerVideo(component);
         const mediaError = video?.error;
-        if (!(component.player && mediaError && mediaError.code === 4)) {
+        if (!(component.player && mediaError && [2, 4].includes(mediaError.code))) return;
+        if (String(component.currChannel?.id) === '10') {
+            requestStreamRecovery(component);
             return;
         }
         ensurePlayableStream(component);
@@ -570,7 +659,7 @@
         if (!hasLive) {
             if (component.__smgNeedShiftBase) {
                 component.__smgRecovering = true;
-                maybeAutoCaptureShift(component, true);
+                maybeAutoCaptureShift(component);
                 setTimeout(() => {
                     component.__smgRecovering = false;
                 }, 2000);
@@ -678,9 +767,15 @@
         const target = document.body || document.documentElement;
         target?.classList?.toggle(VIDEO_READY_CLASS, isReady);
     }
+    function scheduleLoadingSync(component) {
+        if (!component || component.__smgDisposed || component.__smgSyncTimer) return;
+        component.__smgSyncTimer = setTimeout(() => {
+            component.__smgSyncTimer = null;
+            syncLoadingState(component);
+        }, 100);
+    }
     function syncLoadingState(component) {
-        forceOpenProgramList(component);
-        maybeAutoCaptureShift(component, false);
+        if (component?.__smgDisposed) return false;
         recoverPlayerIfNeeded(component);
         const video = getPlayerVideo(component);
         if (video) {
@@ -697,27 +792,40 @@
         if (!video || watchedVideos.has(video)) {
             return;
         }
-        watchedVideos.add(video);
-        const markReady = () => syncLoadingState(component);
+        const controller = new AbortController();
+        watchedVideos.set(video, controller);
+        (component.__smgVideoBindings ||= new Map()).set(video, controller);
+        const markReady = () => scheduleLoadingSync(component);
         const resetReady = () => {
             if (!isVideoReady(video)) {
                 setVideoReadyClass(false);
             }
         };
         VIDEO_READY_EVENTS.forEach(eventName => {
-            video.addEventListener(eventName, markReady, { passive: true });
+            video.addEventListener(eventName, markReady, { passive: true, signal: controller.signal });
         });
         VIDEO_RESET_EVENTS.forEach(eventName => {
-            video.addEventListener(eventName, resetReady, { passive: true });
+            video.addEventListener(eventName, resetReady, { passive: true, signal: controller.signal });
         });
-        video.addEventListener('webkitbeginfullscreen', () => syncFullscreenButtonState(component, true), { passive: true });
-        video.addEventListener('webkitendfullscreen', () => syncFullscreenButtonState(component, false), { passive: true });
+        video.addEventListener('error', markReady, { passive: true, signal: controller.signal });
+        video.addEventListener('webkitbeginfullscreen', () => syncFullscreenButtonState(component, true), { passive: true, signal: controller.signal });
+        video.addEventListener('webkitendfullscreen', () => syncFullscreenButtonState(component, false), { passive: true, signal: controller.signal });
         markReady();
     }
     function cleanupComponent(component) {
         if (!component) {
             return;
         }
+        component.__smgDisposed = true;
+        component.__smgGeneration = (component.__smgGeneration || 0) + 1;
+        activeComponents.delete(component);
+        clearTimeout(component.__smgSyncTimer);
+        component.__smgSyncTimer = null;
+        for (const [video, controller] of component.__smgVideoBindings || []) {
+            controller.abort();
+            watchedVideos.delete(video);
+        }
+        component.__smgVideoBindings?.clear();
         if (component.__smgLoadingMonitor) {
             clearInterval(component.__smgLoadingMonitor);
             component.__smgLoadingMonitor = null;
@@ -741,11 +849,32 @@
                 initComponentPatch();
                 return;
             }
-            maybeAutoCaptureShift(component, true);
+            forceOpenProgramList(component);
+            const video = getPlayerVideo(component);
+            for (const [oldVideo, controller] of component.__smgVideoBindings || []) {
+                if (oldVideo !== video) {
+                    controller.abort();
+                    watchedVideos.delete(oldVideo);
+                    component.__smgVideoBindings.delete(oldVideo);
+                }
+            }
+            // Reset the retry budget only after sustained playback, not a brief canplay.
+            if (video && !video.paused && !video.error && video.readyState >= 2) {
+                if (video.currentTime > (component.__smgLastTime ?? video.currentTime)) {
+                    component.__smgHealthyTicks = (component.__smgHealthyTicks || 0) + 1;
+                    if (component.__smgHealthyTicks >= 15) {
+                        component.__smgAcquireAttempts = 0;
+                        component.__smgRetryStopped = false;
+                        component.__smgRetryAt = 0;
+                    }
+                } else component.__smgHealthyTicks = 0;
+                component.__smgLastTime = video.currentTime;
+            } else component.__smgHealthyTicks = 0;
             syncLoadingState(component);
-        }, 500);
+            maybeAutoCaptureShift(component);
+        }, 2000);
         if (component.$refs?.livePlayer && !component.__smgLoadingObserver) {
-            component.__smgLoadingObserver = new MutationObserver(() => syncLoadingState(component));
+            component.__smgLoadingObserver = new MutationObserver(() => scheduleLoadingSync(component));
             component.__smgLoadingObserver.observe(component.$refs.livePlayer, {
                 childList: true,
                 subtree: true
@@ -964,12 +1093,22 @@
             }
         });
     }
-    function wrapComponentMethod(component, methodName, after) {
+    function wrapComponentMethod(component, methodName) {
         const original = component?.[methodName];
         if (typeof original !== 'function' || original.__smgWrapped) {
             return;
         }
         const wrapped = function() {
+            if (methodName === 'changeChannel' || methodName === 'changeProgram') {
+                this.__smgGeneration = (this.__smgGeneration || 0) + 1;
+                this.__smgAcquireAttempts = 0;
+                this.__smgRetryStopped = false;
+                this.__smgRetryAt = 0;
+                this.__smgHealthyTicks = 0;
+                this.__smgLastTime = null;
+                this.__smgNeedShiftBase = false;
+                this.__smgStreamUrl = '';
+            }
             const programId = this.programObj?.id;
             if (programId && programId !== this.__smgRecoverProgramId) {
                 this.__smgRecoverProgramId = programId;
@@ -979,9 +1118,9 @@
             const result = original.apply(this, arguments);
             const runAfter = () => {
                 ensurePlayableStream(this);
-                setTimeout(() => after(this), 0);
-                setTimeout(() => after(this), 250);
-                setTimeout(() => after(this), 1000);
+                if (this.__smgDisposed) return;
+                forceOpenProgramList(this);
+                scheduleLoadingSync(this);
             };
             if (result && typeof result.then === 'function') {
                 result.then(runAfter, runAfter);
@@ -998,6 +1137,8 @@
         if (!component) {
             return;
         }
+        component.__smgDisposed = false;
+        activeComponents.add(component);
         startLoadingMonitor(component);
         if (component.__smgPatched) {
             syncLoadingState(component);
@@ -1027,7 +1168,7 @@
             component._handlerUnload = null;
         }
         ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel', 'getProgramDetail'].forEach(methodName => {
-            wrapComponentMethod(component, methodName, syncLoadingState);
+            wrapComponentMethod(component, methodName);
         });
         installReplayUrlPatch(component);
         ensurePlayableStream(component);
@@ -1163,10 +1304,9 @@
     const originalOpen = XMLHttpRequest.prototype.open;
     function isTargetTVApi(url) {
         try {
-            return new URL(String(url), location.href).pathname.includes('/content/pc/tv/');
-        } catch (e) {
-            return String(url).includes('/content/pc/tv/');
-        }
+            const u = new URL(String(url), location.href);
+            return u.hostname === 'kapi.kankanews.com' && u.pathname.startsWith('/content/pc/tv/');
+        } catch (e) { return false; }
     }
     function rewriteTvApiResponse(requestUrl, response) {
         let modified = false;
@@ -1198,6 +1338,7 @@
     }
     function replaceXhrResponse(xhr, body) {
         try {
+            xhr.__smgResponsePatched = true;
             Object.defineProperty(xhr, 'responseText', {
                 value: body,
                 writable: false,
@@ -1213,51 +1354,44 @@
         }
     }
     XMLHttpRequest.prototype.open = function(method, url) {
-        this.__smgRequestUrl = String(url);
-        if (isTargetTVApi(this.__smgRequestUrl)) {
-            if (!this.__smgHooked) {
-                this.__smgHooked = true;
-                this.addEventListener('readystatechange', function() {
-                    if (this.readyState !== 4) {
-                        return;
+        if (this.__smgResponsePatched) {
+            delete this.responseText;
+            delete this.response;
+            this.__smgResponsePatched = false;
+        }
+        this.__smgRequestUrl = new URL(String(url), location.href).href;
+        if (!this.__smgHooked) {
+            this.__smgHooked = true;
+            this.addEventListener('readystatechange', function() {
+                if (this.readyState !== 4) return;
+                const requestUrl = this.__smgRequestUrl;
+                observeStreamResponse(requestUrl, this.status);
+                if (!isTargetTVApi(requestUrl) || this.status < 200 || this.status >= 300) return;
+                if (this.responseType && this.responseType !== 'text' && this.responseType !== 'json') return;
+                try {
+                    const response = this.responseType === 'json' ? this.response : JSON.parse(this.responseText);
+                    if (rewriteTvApiResponse(requestUrl, response)) {
+                        replaceXhrResponse(this, JSON.stringify(response));
                     }
-                    const requestUrl = this.__smgRequestUrl;
-                    try {
-                        let response;
-                        let rawText = null;
-                        try {
-                            rawText = this.responseText;
-                        } catch (e) {
-                            rawText = null;
-                        }
-                        if (typeof rawText === 'string' && rawText) {
-                            response = JSON.parse(rawText);
-                        } else if (this.response && typeof this.response === 'object') {
-                            response = this.response;
-                        } else {
-                            return;
-                        }
-                        if (rewriteTvApiResponse(requestUrl, response)) {
-                            replaceXhrResponse(this, JSON.stringify(response));
-                        }
-                    } catch (e) {
-                        throttleLog('parse-error', 5000, () => console.error('[SMGTV] 解析接口响应失败:', e));
-                    }
-                });
-            }
+                } catch (e) {
+                    throttleLog('parse-error', 5000, () => console.warn('[SMGTV] 接口响应解析失败'));
+                }
+            });
         }
         return originalOpen.apply(this, arguments);
     };
-    const originalFetch = window.fetch;
     if (typeof originalFetch === 'function') {
         window.fetch = function(input, init) {
-            const requestUrl = String(typeof input === 'string' ? input : (input && input.url) || '');
-            const request = originalFetch.apply(this, arguments);
+            const requestUrl = new URL(typeof input === 'string' || input instanceof URL ? input : input.url, location.href).href;
+            const request = originalFetch.apply(this, arguments).then(res => {
+                observeStreamResponse(requestUrl, res.status);
+                return res;
+            });
             if (!isTargetTVApi(requestUrl)) {
                 return request;
             }
             return request.then(res => {
-                if (!res) {
+                if (!res || !res.ok) {
                     return res;
                 }
                 try {
