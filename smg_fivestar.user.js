@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目（稳定性优化版）
 // @namespace        https://github.com/ICyChain1211/smg_live
-// @version          0.18.3
+// @version          0.18.4
 // @description      收看SMGTV，并解除页面部分限制
 // @author           Popukok (original), ICyChain1211 (stability fork)
 // @match            *://*.kankanews.com/huikan*
@@ -50,6 +50,7 @@ SOFTWARE.
     const persistedChannelsLoaded = new Set();
     const originalFetch = window.fetch;
     const RETRY_DELAYS = [5000, 15000, 60000];
+    const PLAYBACK_STALL_MS = 30000;
 
     const streamAddressCache = Object.create(null);
     const channelShiftBaseCache = Object.create(null);
@@ -642,13 +643,60 @@ SOFTWARE.
             component.__smgAcquiring = false;
         }
     }
+    function detectPlaybackFailure(component, video) {
+        if (!video) {
+            component.__smgStallWatch = null;
+            return false;
+        }
+        // A failed media element may already be paused. Check errors first.
+        if (video.error && [2, 4].includes(video.error.code)) return true;
+        if (video.paused || video.ended || video.seeking || document.visibilityState === 'hidden') {
+            component.__smgStallWatch = null;
+            return false;
+        }
+        const now = Date.now();
+        const time = video.currentTime;
+        if (!Number.isFinite(time)) return false;
+        const watch = component.__smgStallWatch;
+        if (!watch || watch.video !== video || time < watch.time || time > watch.time + 0.25) {
+            component.__smgStallWatch = { video, time, at: now };
+            return false;
+        }
+        // HLS can fail without assigning video.error, including before the first frame.
+        return now - watch.at >= PLAYBACK_STALL_MS;
+    }
+    function watchPlayerInstance(component) {
+        const player = component.player;
+        if (component.__smgWatchedPlayer === player) return;
+        const old = component.__smgWatchedPlayer;
+        if (old && typeof old.off === 'function') old.off('error', component.__smgPlayerError);
+        component.__smgWatchedPlayer = player;
+        component.__smgStallWatch = null;
+        if (!player) return;
+        // Also cover a player created before the userscript found the Vue component.
+        component.__smgStreamUrl = typeof player.config?.url === 'string' ? player.config.url : '';
+        const channelId = String(component.currChannel?.id);
+        const generation = component.__smgGeneration || 0;
+        if (channelId === '10' && player.config && !player.config.isPad && !player.config.url) {
+            requestStreamRecovery(component);
+        }
+        component.__smgPlayerError = () => {
+            if (component.__smgDisposed || component.player !== player ||
+                String(component.currChannel?.id) !== channelId ||
+                (component.__smgGeneration || 0) !== generation) return;
+            requestStreamRecovery(component);
+        };
+        if (typeof player.on === 'function') player.on('error', component.__smgPlayerError);
+    }
     function recoverPlayerIfNeeded(component) {
         if (!component || typeof component.initPlayer !== 'function' || component.__smgRecovering) {
             return;
         }
         const video = getPlayerVideo(component);
-        const mediaError = video?.error;
-        if (!(component.player && mediaError && [2, 4].includes(mediaError.code))) return;
+        const failed = String(component.currChannel?.id) === '10'
+            ? detectPlaybackFailure(component, video)
+            : video?.error && [2, 4].includes(video.error.code);
+        if (!(component.player && failed)) return;
         if (String(component.currChannel?.id) === '10') {
             requestStreamRecovery(component);
             return;
@@ -776,6 +824,7 @@ SOFTWARE.
     }
     function syncLoadingState(component) {
         if (component?.__smgDisposed) return false;
+        if (component) watchPlayerInstance(component);
         recoverPlayerIfNeeded(component);
         const video = getPlayerVideo(component);
         if (video) {
@@ -818,6 +867,12 @@ SOFTWARE.
         }
         component.__smgDisposed = true;
         component.__smgGeneration = (component.__smgGeneration || 0) + 1;
+        if (typeof component.__smgWatchedPlayer?.off === 'function') {
+            component.__smgWatchedPlayer.off('error', component.__smgPlayerError);
+        }
+        component.__smgWatchedPlayer = null;
+        component.__smgPlayerError = null;
+        component.__smgStallWatch = null;
         activeComponents.delete(component);
         clearTimeout(component.__smgSyncTimer);
         component.__smgSyncTimer = null;
@@ -1106,6 +1161,7 @@ SOFTWARE.
                 this.__smgRetryAt = 0;
                 this.__smgHealthyTicks = 0;
                 this.__smgLastTime = null;
+                this.__smgStallWatch = null;
                 this.__smgNeedShiftBase = false;
                 this.__smgStreamUrl = '';
             }

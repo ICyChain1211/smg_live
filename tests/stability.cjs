@@ -21,7 +21,7 @@ function setup(){
  setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms,type:'timeout'});return id},clearTimeout:k=>timers.delete(k),
  setInterval:(fn,ms)=>{timers.set(++id,{fn,ms,type:'interval'});return id},clearInterval:k=>timers.delete(k),
  MutationObserver:class{observe(){}disconnect(){}}});
- const exposed=source.replace(/\}\)\(\);\s*$/,`globalThis.api={parseJwtExp,loadPersistedShiftBase,forceOpenProgram,serverAllowsReview,findDonorIdFromList,findTodayDonorId,getCachedBase,invalidateChannelCache,smgApiGet,maybeAutoCaptureShift,observeStreamResponse,scheduleLoadingSync,cleanupComponent,installReplayUrlPatch,activeComponents,channelShiftBaseCache,channelLiveBaseCache,pendingAcquisitions,watchedVideos,wrapComponentMethod,startLoadingMonitor,setAcquire:fn=>acquireShiftBase=fn};})();`);
+ const exposed=source.replace(/\}\)\(\);\s*$/,`globalThis.api={parseJwtExp,loadPersistedShiftBase,forceOpenProgram,serverAllowsReview,findDonorIdFromList,findTodayDonorId,getCachedBase,invalidateChannelCache,smgApiGet,maybeAutoCaptureShift,observeStreamResponse,scheduleLoadingSync,cleanupComponent,installReplayUrlPatch,activeComponents,channelShiftBaseCache,channelLiveBaseCache,pendingAcquisitions,watchedVideos,wrapComponentMethod,startLoadingMonitor,detectPlaybackFailure,watchPlayerInstance,recoverPlayerIfNeeded,setAcquire:fn=>acquireShiftBase=fn};})();`);
  vm.runInContext(exposed,context);
  return {c:context,a:context.api,ls,timers,fetchCalls,setFetch:f=>fetchImpl=f,setNow:n=>now=n,now:()=>now};
 }
@@ -121,5 +121,61 @@ const tick=async()=>{for(let i=0;i<8;i++) await Promise.resolve()};
  check(()=>assert.equal(tc.__smgNeedShiftBase,true));
  check(()=>assert.equal(tc.__smgAcquireAttempts,1));
  check(()=>assert.equal(tc.__smgAcquiring,false));
+ // HLS can stall with no MediaError, even before the first frame.
+ const stall=setup(),sc={},video={paused:false,ended:false,seeking:false,currentTime:0,error:null};
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),false));
+ stall.setNow(stall.now()+29999);
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),false));
+ stall.setNow(stall.now()+1);
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),true));
+ video.currentTime=15;
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),false));
+ stall.setNow(stall.now()+30000);
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),true));
+ // Pausing, seeking and backgrounding discard the previous observation window.
+ for(const key of ['paused','seeking','ended']){
+  video[key]=true;check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),false));
+  video[key]=false;check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),false));
+ }
+ stall.c.document.visibilityState='hidden';stall.setNow(stall.now()+60000);
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),false));
+ stall.c.document.visibilityState='visible';
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,video),false));
+ const replacement={...video};stall.setNow(stall.now()+30000);
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,replacement),false));
+ replacement.paused=true;replacement.error={code:2};
+ check(()=>assert.equal(stall.a.detectPlaybackFailure(sc,replacement),true));
+ // Real monitor recovery uses the same bounded acquisition path.
+ const live={currChannel:{id:10},player:{video},initPlayer(){}};
+ stall.a.recoverPlayerIfNeeded(live);stall.setNow(stall.now()+30000);stall.a.recoverPlayerIfNeeded(live);
+ check(()=>assert.equal(live.__smgNeedShiftBase,true));
+ // Player-level errors need no video.error and must not leak across player swaps.
+ function fakePlayer(url){return {config:{url},handlers:new Set(),on(name,fn){this.handlers.add(fn)},off(name,fn){this.handlers.delete(fn)}}}
+ const oldPlayer=fakePlayer('https://example.com/initial.m3u8');
+ const pc={currChannel:{id:10},player:oldPlayer};
+ stall.a.activeComponents.add(pc);stall.a.watchPlayerInstance(pc);stall.a.watchPlayerInstance(pc);
+ check(()=>assert.equal(oldPlayer.handlers.size,1));
+ stall.a.observeStreamResponse(oldPlayer.config.url,403);
+ check(()=>assert.equal(pc.__smgNeedShiftBase,true));
+ const oldError=[...oldPlayer.handlers][0];pc.player=fakePlayer('https://example.com/new.m3u8');
+ pc.__smgNeedShiftBase=false;stall.a.watchPlayerInstance(pc);oldError();
+ check(()=>assert.equal(oldPlayer.handlers.size,0));
+ check(()=>assert.equal(pc.__smgNeedShiftBase,false));
+ const newError=[...pc.player.handlers][0];newError();
+ check(()=>assert.equal(pc.__smgNeedShiftBase,true));
+ pc.__smgNeedShiftBase=false;pc.__smgRetryStopped=true;newError();
+ check(()=>assert.equal(pc.__smgNeedShiftBase,false));
+ stall.a.cleanupComponent(pc);newError();
+ check(()=>assert.equal(pc.player.handlers.size,0));
+ check(()=>assert.equal(pc.__smgNeedShiftBase,false));
+ const empty={currChannel:{id:10},player:fakePlayer('')};
+ stall.a.watchPlayerInstance(empty);
+ check(()=>assert.equal(empty.__smgNeedShiftBase,true));
+ const changing={currChannel:{id:10},player:fakePlayer('https://example.com/old-channel.m3u8')};
+ stall.a.watchPlayerInstance(changing);const previousError=[...changing.player.handlers][0];
+ changing.currChannel={id:1};previousError();
+ check(()=>assert.equal(changing.__smgNeedShiftBase,undefined));
+ changing.currChannel={id:10};changing.__smgGeneration=1;previousError();
+ check(()=>assert.equal(changing.__smgNeedShiftBase,undefined));
  console.log(`${count} behavioral checks passed. No live network or installed userscript changes.`);
 })().catch(e=>{console.error(e);process.exitCode=1});
